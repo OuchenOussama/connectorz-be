@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = "postgres://6a96d909d308181f8405ee6644138bac0734cace5a2feefe71ff7e3891f758fd:sk_ap2LeVvXSD7fVGT2QjMSJ@db.prisma.io:5432/postgres?sslmode=require"
+}
+
+model User {
+  id                Int               @id @default(autoincrement())
+  name              String
+  email             String            @unique
+  emailVerifiedAt   DateTime?         @map("email_verified_at")
+  password          String
+  rememberToken     String?           @map("remember_token")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+  oauthConnections  OAuthConnection[]
+
+  @@map("users")
+}
+
+model OAuthConnection {
+  id                Int       @id @default(autoincrement())
+  userId            Int       @map("user_id")
+  connectorId       String    @map("connector_id")
+  accessToken       String    @map("access_token")
+  refreshToken      String?   @map("refresh_token")
+  tokenType         String    @default("Bearer") @map("token_type")
+  expiresAt         DateTime? @map("expires_at")
+  scopes            Json
+  status            Status    @default(active)
+  connectorMetadata Json?     @map("connector_metadata")
+  grantedAt         DateTime  @map("granted_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, connectorId])
+  @@index([connectorId, status])
+  @@map("oauth_connections")
+}
+
+enum Status {
+  active
+  expired
+  revoked
+}
