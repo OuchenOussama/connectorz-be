@@ -13,7 +13,7 @@ class OAuthController extends Controller
 {
     public function __construct(private OAuthService $oauthService) {}
 
-    public function authorize(Request $request): JsonResponse
+    public function authorize(Request $request)
     {
         $request->validate([
             'userId' => 'required|string',
@@ -30,11 +30,11 @@ class OAuthController extends Controller
                 $request->redirectUri
             );
 
-            return response()->json($authData);
+            return redirect($authData['authUrl']);
         } catch (\InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 400);
+            return response('<h1>Error</h1><p>' . $e->getMessage() . '</p>', 400);
         } catch (\Exception $e) {
-            return response()->json(['error' => 'Failed to generate auth URL'], 500);
+            return response('<h1>Error</h1><p>Failed to generate auth URL</p>', 500);
         }
     }
 
