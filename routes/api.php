@@ -9,6 +9,9 @@ Route::prefix('oauth')->group(function () {
     
     Route::get('/connections/{userId}/{connectorId}', [OAuthController::class, 'checkConnection']);
     Route::get('/connections/{userId}', [OAuthController::class, 'listConnections']);
-    Route::delete('/connections/{userId}/{connectorId}', [OAuthController::class, 'revokeConnection']);
-    Route::patch('/connections/{userId}/{connectorId}/scopes', [OAuthController::class, 'updateScopes']);
+    Route::delete('/connections/{userId}/{connectorId}/{accountIdentifier}', [OAuthController::class, 'revokeConnection']);
+    Route::patch('/connections/{userId}/{connectorId}/{accountIdentifier}/scopes', [OAuthController::class, 'updateScopes']);
+    
+    Route::get('/token/{userId}/{connectorId}/{accountIdentifier}', [OAuthController::class, 'getValidToken']);
+    Route::post('/token/{userId}/{connectorId}/{accountIdentifier}/refresh', [OAuthController::class, 'forceRefreshToken']);
 });

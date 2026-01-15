@@ -12,6 +12,7 @@ class OAuthConnection extends Model
     protected $fillable = [
         'user_id',
         'connector_id',
+        'account_identifier',
         'access_token',
         'refresh_token',
         'token_type',

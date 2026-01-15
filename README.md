@@ -1,39 +1,77 @@
+# OAuth Connection Management API
+
 ## Overview
 
-This document outlines all necessary backend endpoints for managing OAuth connections, tokens, and automation workflows.
+Complete backend API for managing OAuth connections, tokens, and multi-account support for SaaS automation platforms.
+
+**Base URL:** `http://localhost:8000/api/oauth`
+
+**Supported Connectors:** Gmail, LinkedIn, Facebook, Stripe, Shopify
+
+**Database:** PostgreSQL (Prisma Cloud)
 
 ---
 
-## 1. Authentication & Authorization Endpoints
+## Database Schema
+
+```sql
+CREATE TABLE oauth_connections (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  connector_id VARCHAR(255) NOT NULL,
+  account_identifier VARCHAR(255),
+  access_token TEXT NOT NULL,
+  refresh_token TEXT,
+  token_type VARCHAR(255) DEFAULT 'Bearer',
+  expires_at TIMESTAMP,
+  scopes JSON NOT NULL,
+  status VARCHAR(255) CHECK (status IN ('active', 'expired', 'revoked')) DEFAULT 'active',
+  connector_metadata JSON,
+  granted_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP,
+  UNIQUE (user_id, connector_id, account_identifier)
+);
+
+CREATE INDEX idx_user_connector ON oauth_connections(user_id, connector_id);
+CREATE INDEX idx_status ON oauth_connections(status);
+CREATE INDEX idx_expires_at ON oauth_connections(expires_at);
+```
+
+**Key Features:**
+- `account_identifier`: Unique identifier per account (email for Gmail, user ID for LinkedIn/Facebook)
+- `connector_metadata`: Stores user profile data (email, name, picture, etc.)
+- `scopes`: JSON array of granted OAuth scopes
+- `status`: Connection status (active, expired, revoked)
+- Supports multiple accounts per connector per user
+
+---
+
+## 1. Authentication & Authorization
 
 ### 1.1 Initiate OAuth Flow
 
 **Endpoint:** `GET /api/oauth/authorize`
 
-**Purpose:** Generate authorization URL for OAuth flow
+**Purpose:** Redirects user to OAuth provider's authorization page
 
 **Query Parameters:**
-
 - `userId` (required): User identifier
-- `connectorId` (required): Connector identifier (e.g., 'gmail', 'linkedin')
+- `connectorId` (required): Connector identifier (`gmail`, `linkedin`, `facebook`, `stripe`, `shopify`)
 - `scopes` (required): Space-separated list of requested scopes
 - `redirectUri` (optional): Custom redirect URI
 
-**Response:**
+**Behavior:** Redirects to OAuth provider (not JSON response)
 
-```json
-{
-  "authUrl": "https://accounts.google.com/o/oauth2/v2/auth?...",
-  "state": "random_state_token",
-  "connectorId": "gmail"
-}
-
+**Example:**
+```
+GET /api/oauth/authorize?userId=user123&connectorId=gmail&scopes=openid%20email%20profile
 ```
 
-**Error Cases:**
-
-- 400: Invalid connector or missing parameters
-- 500: Failed to generate auth URL
+**Error Response:**
+```html
+<h1>Error</h1><p>Unsupported connector: invalid_connector</p>
+```
 
 ---
 
@@ -41,91 +79,104 @@ This document outlines all necessary backend endpoints for managing OAuth connec
 
 **Endpoint:** `GET /api/oauth/callback`
 
-**Purpose:** Handle OAuth provider callback and exchange code for tokens
+**Purpose:** Handles OAuth provider callback, exchanges code for tokens, stores in database
 
 **Query Parameters:**
-
 - `code` (required): Authorization code from provider
-- `state` (required): State token for CSRF protection
-- `connectorId` (required): Connector identifier
+- `state` (required): State token (contains userId, connectorId, CSRF token)
 
 **Process:**
+1. Validates state token
+2. Exchanges code for access/refresh tokens
+3. Fetches user profile metadata from OAuth provider
+4. Extracts `account_identifier` from metadata (email or user ID)
+5. Stores/updates in `oauth_connections` table
+6. Returns HTML page that sends postMessage to parent window
 
-1. Validate state token
-2. Exchange code for access/refresh tokens
-3. Store tokens in `oauth_connections` table
-4. Retrieve and store connector-specific metadata
-5. Return success page or redirect
-
-**Response:**
-
+**Success Response (HTML):**
 ```html
-<!-- Success page that closes the popup window -->
 <script>
-  window.opener.postMessage({ success: true, connectorId: 'gmail' }, '*');
+  window.opener.postMessage({ 
+    success: true, 
+    connectorId: "gmail" 
+  }, "*");
   window.close();
 </script>
-
+<p>Authorization complete. You can close this window.</p>
 ```
 
-**Database Operations:**
-
-```sql
-INSERT INTO oauth_connections (
-  user_id, connector_id, access_token, refresh_token,
-  token_type, expires_at, scopes, status,
-  connector_metadata, granted_at
-) VALUES (...);
-
+**Error Response (HTML):**
+```html
+<script>
+  window.opener.postMessage({ 
+    success: false, 
+    error: "Failed to exchange code for tokens" 
+  }, "*");
+  window.close();
+</script>
+<p>Authorization failed: [error message]</p>
 ```
 
 ---
 
-## 2. Connection Management Endpoints
+## 2. Connection Management
 
 ### 2.1 Check Connection Status
 
 **Endpoint:** `GET /api/oauth/connections/:userId/:connectorId`
 
-**Purpose:** Check if user has active connection to a connector
+**Purpose:** Returns all accounts connected for a specific connector
 
 **Path Parameters:**
-
 - `userId`: User identifier
 - `connectorId`: Connector identifier
 
-**Response:**
+**Example:**
+```
+GET /api/oauth/connections/user123/gmail
+```
 
+**Response (Connected):**
 ```json
 {
   "connected": true,
   "connectorId": "gmail",
-  "status": "active",
-  "grantedScopes": [
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/gmail.send"
-  ],
-  "grantedAt": "2025-01-10T12:00:00Z",
-  "lastUsedAt": "2025-01-12T08:30:00Z",
-  "expiresAt": "2025-01-12T13:00:00Z",
-  "metadata": {
-    "email": "user@gmail.com",
-    "accountId": "123456789"
-  }
+  "accounts": [
+    {
+      "accountIdentifier": "user@gmail.com",
+      "status": "active",
+      "grantedScopes": ["openid", "email", "profile"],
+      "grantedAt": "2025-01-15T12:00:00.000000Z",
+      "expiresAt": "2025-01-15T13:00:00.000000Z",
+      "metadata": {
+        "email": "user@gmail.com",
+        "id": "123456789",
+        "name": "John Doe",
+        "picture": "https://..."
+      }
+    },
+    {
+      "accountIdentifier": "work@gmail.com",
+      "status": "active",
+      "grantedScopes": ["openid", "email", "profile"],
+      "grantedAt": "2025-01-15T14:00:00.000000Z",
+      "expiresAt": "2025-01-15T15:00:00.000000Z",
+      "metadata": {
+        "email": "work@gmail.com",
+        "id": "987654321",
+        "name": "John Work"
+      }
+    }
+  ]
 }
-
 ```
 
 **Response (Not Connected):**
-
 ```json
 {
   "connected": false,
   "connectorId": "gmail"
 }
-
 ```
 
 ---
@@ -134,89 +185,102 @@ INSERT INTO oauth_connections (
 
 **Endpoint:** `GET /api/oauth/connections/:userId`
 
-**Purpose:** Get all active connections for a user
+**Purpose:** Returns all OAuth connections for a user across all connectors
 
 **Path Parameters:**
-
 - `userId`: User identifier
 
 **Query Parameters:**
+- `status` (optional): Filter by status (`active`, `expired`, `revoked`)
+- `includeMetadata` (optional): Include connector metadata (default: `false`)
 
-- `status` (optional): Filter by status (active, expired, revoked, error)
-- `includeMetadata` (optional): Include connector metadata (default: false)
+**Example:**
+```
+GET /api/oauth/connections/user123?status=active&includeMetadata=true
+```
 
 **Response:**
-
 ```json
 {
-  "userId": "user_123",
+  "userId": "user123",
   "connections": [
     {
       "connectorId": "gmail",
+      "accountIdentifier": "user@gmail.com",
       "status": "active",
-      "grantedScopes": ["openid", "email", "profile", "..."],
-      "grantedAt": "2025-01-10T12:00:00Z",
-      "lastUsedAt": "2025-01-12T08:30:00Z",
-      "expiresAt": "2025-01-12T13:00:00Z"
+      "grantedScopes": ["openid", "email", "profile"],
+      "grantedAt": "2025-01-15T12:00:00.000000Z",
+      "expiresAt": "2025-01-15T13:00:00.000000Z",
+      "metadata": {
+        "email": "user@gmail.com",
+        "id": "123456789"
+      }
     },
     {
       "connectorId": "linkedin",
+      "accountIdentifier": "linkedin-user-id",
       "status": "active",
       "grantedScopes": ["openid", "profile", "email"],
-      "grantedAt": "2025-01-11T14:00:00Z",
-      "lastUsedAt": "2025-01-12T09:00:00Z",
-      "expiresAt": "2025-01-12T14:00:00Z"
+      "grantedAt": "2025-01-15T14:00:00.000000Z",
+      "expiresAt": "2025-01-15T15:00:00.000000Z"
     }
   ],
   "total": 2
 }
-
 ```
 
 ---
 
 ### 2.3 Revoke Connection
 
-**Endpoint:** `DELETE /api/oauth/connections/:userId/:connectorId`
+**Endpoint:** `DELETE /api/oauth/connections/:userId/:connectorId/:accountIdentifier`
 
-**Purpose:** Revoke OAuth connection and optionally revoke from provider
+**Purpose:** Revokes a specific account connection
 
 **Path Parameters:**
-
 - `userId`: User identifier
 - `connectorId`: Connector identifier
+- `accountIdentifier`: Account identifier (email or ID from metadata)
 
 **Query Parameters:**
+- `revokeFromProvider` (optional): Revoke token from OAuth provider (default: `true`)
 
-- `revokeFromProvider` (optional): Revoke token from OAuth provider (default: true)
-
-**Process:**
-
-1. Update status to 'revoked' in database
-2. Optionally call provider's revocation endpoint
-3. Clean up associated data
+**Example:**
+```
+DELETE /api/oauth/connections/user123/gmail/user@gmail.com?revokeFromProvider=true
+```
 
 **Response:**
-
 ```json
 {
   "success": true,
   "connectorId": "gmail",
-  "revokedAt": "2025-01-12T10:00:00Z"
+  "accountIdentifier": "user@gmail.com",
+  "revokedAt": "2025-01-15T10:00:00.000000Z"
 }
 ```
 
-### 2.4 Token Update Workflow (Scope Upgrade)
+**Error Response:**
+```json
+{
+  "error": "Connection not found"
+}
+```
 
-**Endpoint:** `PATCH /api/oauth/connections/:userId/:connectorId/scopes`
+---
+
+### 2.4 Update Scopes (Request Re-authorization)
+
+**Endpoint:** `PATCH /api/oauth/connections/:userId/:connectorId/:accountIdentifier/scopes`
+
+**Purpose:** Requests additional scopes for an existing connection
 
 **Path Parameters:**
-
-- `userId` – User identifier
-- `connectorId` – Connector identifier (e.g. `gmail`, `linkedin`, `facebook`)
+- `userId`: User identifier
+- `connectorId`: Connector identifier
+- `accountIdentifier`: Account identifier
 
 **Request Body:**
-
 ```json
 {
   "additionalScopes": [
@@ -226,530 +290,324 @@ INSERT INTO oauth_connections (
 }
 ```
 
+**Example:**
+```
+PATCH /api/oauth/connections/user123/gmail/user@gmail.com/scopes
+Content-Type: application/json
+
+{
+  "additionalScopes": ["https://www.googleapis.com/auth/calendar"]
+}
+```
+
+**Response:**
+```json
+{
+  "requiresReauth": true,
+  "authUrl": "https://accounts.google.com/o/oauth2/v2/auth?client_id=...&scope=openid+email+profile+https://www.googleapis.com/auth/calendar&...",
+  "message": "Additional scopes require re-authorization"
+}
+```
+
+**Error Response:**
+```json
+{
+  "error": "Connection not found"
+}
+```
+
 ---
 
-## 3. Token Management Endpoints
+## 3. Token Management
 
 ### 3.1 Get Valid Access Token
 
-**Endpoint:** `GET /api/oauth/token/:userId/:connectorId`
+**Endpoint:** `GET /api/oauth/token/:userId/:connectorId/:accountIdentifier`
 
-**Purpose:** Get a valid access token, refreshing if necessary
+**Purpose:** Returns a valid access token, automatically refreshing if expired or expiring within 5 minutes
 
 **Path Parameters:**
-
 - `userId`: User identifier
 - `connectorId`: Connector identifier
+- `accountIdentifier`: Account identifier
+
+**Example:**
+```
+GET /api/oauth/token/user123/gmail/user@gmail.com
+```
 
 **Process:**
-
-1. Retrieve connection from database
-2. Check if token is expired
-3. If expired, refresh the token
-4. Update `last_used_at` timestamp
-5. Return valid token
+1. Retrieves connection from database
+2. Checks if token expires in next 5 minutes
+3. Auto-refreshes if needed using refresh token
+4. Updates database with new tokens
+5. Returns valid access token
 
 **Response:**
-
 ```json
 {
   "accessToken": "ya29.a0AfH6SMBx...",
   "tokenType": "Bearer",
-  "expiresAt": "2025-01-12T13:00:00Z",
-  "scopes": ["openid", "email", "profile", "..."]
+  "expiresAt": "2025-01-15T13:00:00.000000Z",
+  "scopes": ["openid", "email", "profile"]
 }
-
 ```
 
 **Error Cases:**
 
-- 404: Connection not found
-- 401: Connection revoked or expired (refresh failed)
-- 500: Token refresh failed
+**404 - Connection Not Found:**
+```json
+{
+  "error": "Connection not found"
+}
+```
+
+**401 - Connection Not Active:**
+```json
+{
+  "error": "Connection is not active"
+}
+```
+
+**401 - Token Expired, No Refresh Token:**
+```json
+{
+  "error": "Token expired and no refresh token available"
+}
+```
+
+**500 - Refresh Failed:**
+```json
+{
+  "error": "Failed to refresh token"
+}
+```
 
 ---
 
 ### 3.2 Force Refresh Token
 
-**Endpoint:** `POST /api/oauth/token/:userId/:connectorId/refresh`
+**Endpoint:** `POST /api/oauth/token/:userId/:connectorId/:accountIdentifier/refresh`
 
-**Purpose:** Manually trigger token refresh
+**Purpose:** Manually triggers token refresh
 
 **Path Parameters:**
-
 - `userId`: User identifier
 - `connectorId`: Connector identifier
+- `accountIdentifier`: Account identifier
+
+**Example:**
+```
+POST /api/oauth/token/user123/gmail/user@gmail.com/refresh
+```
 
 **Process:**
-
-1. Retrieve refresh token from database
-2. Call provider's token refresh endpoint
-3. Update `oauth_connections` table with new tokens
-4. Log refresh attempt in `oauth_refresh_log`
+1. Retrieves refresh token from database
+2. Calls provider's token refresh endpoint
+3. Updates `oauth_connections` table with new tokens
+4. Marks connection as `active`
+5. Returns new access token
 
 **Response:**
-
 ```json
 {
   "success": true,
   "accessToken": "ya29.a0AfH6SMBx...",
-  "expiresAt": "2025-01-12T13:00:00Z",
-  "refreshedAt": "2025-01-12T12:00:00Z"
+  "expiresAt": "2025-01-15T13:00:00.000000Z",
+  "refreshedAt": "2025-01-15T12:00:00.000000Z"
 }
-
 ```
 
-**Database Operations:**
+**Error Cases:**
 
-```sql
--- Update tokens
-UPDATE oauth_connections
-SET access_token = ?,
-    expires_at = ?,
-    last_refresh_at = NOW(),
-    status = 'active'
-WHERE user_id = ? AND connector_id = ?;
+**404 - Connection Not Found:**
+```json
+{
+  "error": "Connection not found"
+}
+```
 
--- Log refresh
-INSERT INTO oauth_refresh_log (connection_id, success, refresh_attempted_at)
-VALUES (?, true, NOW());
+**400 - No Refresh Token:**
+```json
+{
+  "error": "No refresh token available"
+}
+```
 
+**500 - Refresh Failed:**
+```json
+{
+  "error": "Failed to refresh token: [error details]"
+}
 ```
 
 ---
 
-### 3.3 Batch Token Refresh (Background Job)
+## 4. Supported Connectors
 
-**Endpoint:** `POST /api/oauth/token/refresh-batch`
+### Gmail
+- **Connector ID:** `gmail`
+- **Scopes:** `openid email profile https://www.googleapis.com/auth/gmail.send`
+- **Account Identifier:** Email address
+- **Metadata Fields:** `{ id, email, verified_email, name, given_name, family_name, picture, hd }`
 
-**Purpose:** Background job to refresh expiring tokens
+### LinkedIn
+- **Connector ID:** `linkedin`
+- **Scopes:** `openid profile email`
+- **Account Identifier:** LinkedIn user ID (sub)
+- **Metadata Fields:** `{ sub, name, email }`
 
-**Request Body:**
+### Facebook
+- **Connector ID:** `facebook`
+- **Scopes:** `email public_profile`
+- **Account Identifier:** Facebook user ID
+- **Metadata Fields:** `{ id, name, email }`
 
-```json
-{
-  "expiresWithinMinutes": 30,
-  "limit": 100
-}
+### Stripe
+- **Connector ID:** `stripe`
+- **Scopes:** Stripe-specific
+- **Account Identifier:** `stripe_user_id`
 
-```
+### Shopify
+- **Connector ID:** `shopify`
+- **Scopes:** Shopify-specific
+- **Account Identifier:** Shop domain
 
-**Process:**
+---
 
-1. Find connections expiring within specified time
-2. Refresh tokens in batch
-3. Update database
-4. Log results
+## 5. Frontend Integration
 
-**Query:**
+### OAuth Popup Flow
 
-```sql
-SELECT * FROM oauth_connections
-WHERE status = 'active'
-  AND expires_at < DATE_ADD(NOW(), INTERVAL ? MINUTE)
-  AND refresh_token IS NOT NULL
-LIMIT ?;
+```javascript
+const connectService = (userId, connectorId, scopes) => {
+  // Open popup window
+  const popup = window.open(
+    `http://localhost:8000/api/oauth/authorize?userId=${userId}&connectorId=${connectorId}&scopes=${encodeURIComponent(scopes)}`,
+    'oauth',
+    'width=600,height=700'
+  );
 
-```
-
-**Response:**
-
-```json
-{
-  "processed": 15,
-  "successful": 14,
-  "failed": 1,
-  "failures": [
-    {
-      "userId": "user_456",
-      "connectorId": "linkedin",
-      "error": "Invalid refresh token"
+  // Listen for postMessage from callback
+  const handleMessage = (event) => {
+    if (event.data.success) {
+      console.log('✓ Connected:', event.data.connectorId);
+      // Refresh UI, fetch connections, etc.
+      window.removeEventListener('message', handleMessage);
+    } else if (event.data.error) {
+      console.error('✗ Failed:', event.data.error);
+      window.removeEventListener('message', handleMessage);
     }
-  ]
-}
+  };
 
+  window.addEventListener('message', handleMessage);
+};
+
+// Usage Examples
+connectService('user123', 'gmail', 'openid email profile');
+connectService('user123', 'linkedin', 'openid profile email');
 ```
 
----
+### Fetch User Connections
 
-## 4. Scope Management Endpoints
-
-### 4.1 Update Connection Scopes
-
-**Endpoint:** `PATCH /api/oauth/connections/:userId/:connectorId/scopes`
-
-**Purpose:** Add additional scopes to existing connection (requires re-auth)
-
-**Path Parameters:**
-
-- `userId`: User identifier
-- `connectorId`: Connector identifier
-
-**Request Body:**
-
-```json
-{
-  "additionalScopes": [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive.file"
-  ]
-}
-
+```javascript
+const fetchConnections = async (userId) => {
+  const response = await fetch(`http://localhost:8000/api/oauth/connections/${userId}?includeMetadata=true`);
+  const data = await response.json();
+  
+  console.log(`Total connections: ${data.total}`);
+  data.connections.forEach(conn => {
+    console.log(`${conn.connectorId}: ${conn.accountIdentifier} (${conn.status})`);
+  });
+};
 ```
 
-**Response:**
-
-```json
-{
-  "requiresReauth": true,
-  "authUrl": "https://accounts.google.com/o/oauth2/v2/auth?...",
-  "message": "Additional scopes require re-authorization"
-}
-
-```
-
----
-
-### 4.2 Check Granted Scopes
-
-**Endpoint:** `GET /api/oauth/connections/:userId/:connectorId/scopes`
-
-**Purpose:** Check if user has granted specific scopes
-
-**Path Parameters:**
-
-- `userId`: User identifier
-- `connectorId`: Connector identifier
-
-**Query Parameters:**
-
-- `requiredScopes`: Comma-separated list of required scopes
-
-**Response:**
-
-```json
-{
-  "connectorId": "gmail",
-  "grantedScopes": [
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/gmail.send"
-  ],
-  "requiredScopes": [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/calendar"
-  ],
-  "hasAllRequired": false,
-  "missingScopes": [
-    "https://www.googleapis.com/auth/calendar"
-  ]
-}
-
-```
-
----
-
-## 5. Health & Monitoring Endpoints
-
-### 5.1 Connection Health Check
-
-**Endpoint:** `GET /api/oauth/health/:userId/:connectorId`
-
-**Purpose:** Verify connection is working by making test API call
-
-**Path Parameters:**
-
-- `userId`: User identifier
-- `connectorId`: Connector identifier
-
-**Process:**
-
-1. Get valid token
-2. Make test API call to provider
-3. Update status based on response
-
-**Response:**
-
-```json
-{
-  "healthy": true,
-  "connectorId": "gmail",
-  "lastChecked": "2025-01-12T10:00:00Z",
-  "status": "active",
-  "testEndpoint": "https://gmail.googleapis.com/gmail/v1/users/me/profile"
-}
-
-```
-
-**Error Response:**
-
-```json
-{
-  "healthy": false,
-  "connectorId": "gmail",
-  "status": "error",
-  "error": "Token invalid or expired",
-  "lastChecked": "2025-01-12T10:00:00Z"
-}
-
-```
-
----
-
-### 5.2 Get Connection Analytics
-
-**Endpoint:** `GET /api/oauth/analytics/:userId`
-
-**Purpose:** Get usage statistics for user's connections
-
-**Path Parameters:**
-
-- `userId`: User identifier
-
-**Query Parameters:**
-
-- `connectorId` (optional): Filter by specific connector
-- `days` (optional): Days of history (default: 30)
-
-**Response:**
-
-```json
-{
-  "userId": "user_123",
-  "period": "30days",
-  "connections": [
-    {
-      "connectorId": "gmail",
-      "totalRequests": 1543,
-      "lastUsedAt": "2025-01-12T08:30:00Z",
-      "totalRefreshes": 12,
-      "averageTokenLifetime": "3600s",
-      "status": "active"
-    }
-  ]
-}
-
-```
-
----
-
-### 5.3 Get Refresh History
-
-**Endpoint:** `GET /api/oauth/refresh-history/:userId/:connectorId`
-
-**Purpose:** Get token refresh history for debugging
-
-**Path Parameters:**
-
-- `userId`: User identifier
-- `connectorId`: Connector identifier
-
-**Query Parameters:**
-
-- `limit` (optional): Number of records (default: 50)
-- `offset` (optional): Pagination offset
-
-**Response:**
-
-```json
-{
-  "connectorId": "gmail",
-  "history": [
-    {
-      "refreshedAt": "2025-01-12T09:00:00Z",
-      "success": true,
-      "errorMessage": null
-    },
-    {
-      "refreshedAt": "2025-01-12T06:00:00Z",
-      "success": false,
-      "errorMessage": "Network timeout"
-    }
-  ],
-  "total": 145,
-  "limit": 50,
-  "offset": 0
-}
-
-```
-
----
-
-## 6. Webhook/Notification Endpoints
-
-### 6.1 Provider Webhook Handler
-
-**Endpoint:** `POST /api/oauth/webhook/:connectorId`
-
-**Purpose:** Handle webhooks from OAuth providers (token revocation, etc.)
-
-**Path Parameters:**
-
-- `connectorId`: Connector identifier
-
-**Request Body:** (Varies by provider)
-
-```json
-{
-  "event": "token.revoked",
-  "accountId": "123456789",
-  "timestamp": "2025-01-12T10:00:00Z"
-}
-
-```
-
-**Process:**
-
-1. Verify webhook signature
-2. Update connection status
-3. Notify affected users
-
----
-
-## 7. Admin/System Endpoints
-
-### 7.1 Get System-Wide Connection Stats
-
-**Endpoint:** `GET /api/oauth/admin/stats`
-
-**Purpose:** Get platform-wide OAuth statistics
-
-**Query Parameters:**
-
-- `days` (optional): Days of history (default: 7)
-
-**Response:**
-
-```json
-{
-  "totalConnections": 5432,
-  "activeConnections": 5123,
-  "expiredConnections": 234,
-  "revokedConnections": 75,
-  "byConnector": {
-    "gmail": 1234,
-    "linkedin": 987,
-    "facebook": 876
-  },
-  "refreshSuccessRate": 98.5,
-  "averageTokenLifetime": "3600s"
-}
-
-```
-
----
-
-### 7.2 Cleanup Expired Connections
-
-**Endpoint:** `POST /api/oauth/admin/cleanup`
-
-**Purpose:** Remove old expired/revoked connections
-
-**Request Body:**
-
-```json
-{
-  "olderThanDays": 90,
-  "status": ["expired", "revoked"],
-  "dryRun": false
-}
-
-```
-
-**Response:**
-
-```json
-{
-  "deleted": 142,
-  "dryRun": false,
-  "deletedByStatus": {
-    "expired": 89,
-    "revoked": 53
+### Get Valid Token for API Calls
+
+```javascript
+const getToken = async (userId, connectorId, accountIdentifier) => {
+  const response = await fetch(
+    `http://localhost:8000/api/oauth/token/${userId}/${connectorId}/${encodeURIComponent(accountIdentifier)}`
+  );
+  
+  if (response.ok) {
+    const data = await response.json();
+    return data.accessToken; // Use this token for API calls
+  } else {
+    const error = await response.json();
+    console.error('Token error:', error.error);
+    return null;
   }
-}
+};
 
+// Usage
+const token = await getToken('user123', 'gmail', 'user@gmail.com');
+// Use token to call Gmail API
 ```
 
 ---
 
-## API Design Best Practices
+## 6. Environment Variables
 
-### Authentication
+```env
+# Application
+APP_URL=http://localhost:8000
 
-All endpoints should require authentication via:
+# OAuth Connectors
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
 
-- JWT tokens in `Authorization` header
-- API keys for system/background jobs
-- Webhook signature verification for provider webhooks
+LINKEDIN_CLIENT_ID=your_linkedin_client_id
+LINKEDIN_CLIENT_SECRET=your_linkedin_client_secret
 
-### Rate Limiting
+FACEBOOK_CLIENT_ID=your_facebook_client_id
+FACEBOOK_CLIENT_SECRET=your_facebook_client_secret
 
-Implement rate limiting:
+STRIPE_CLIENT_ID=your_stripe_client_id
+STRIPE_CLIENT_SECRET=your_stripe_client_secret
 
-- Per user: 100 requests/minute
-- Per IP: 1000 requests/minute
-- Token refresh: 1 request per connection every 5 minutes
+SHOPIFY_CLIENT_ID=your_shopify_client_id
+SHOPIFY_CLIENT_SECRET=your_shopify_client_secret
 
-### Error Handling
-
-Standard error response format:
-
-```json
-{
-  "error": {
-    "code": "TOKEN_EXPIRED",
-    "message": "The access token has expired",
-    "details": {
-      "connectorId": "gmail",
-      "userId": "user_123",
-      "expiredAt": "2025-01-12T10:00:00Z"
-    }
-  }
-}
-
+# Database
+DB_CONNECTION=pgsql
+DB_HOST=db.prisma.io
+DB_PORT=5432
+DB_DATABASE=postgres
+DB_USERNAME=your_username
+DB_PASSWORD=your_password
 ```
-
-### Logging
-
-Log all token operations:
-
-- Token grants
-- Token refreshes (success/failure)
-- Connection revocations
-- Failed API calls
-
-### Security Considerations
-
-1. **Encrypt tokens at rest** in database
-2. **Use HTTPS** for all endpoints
-3. **Implement CSRF protection** for OAuth flows
-4. **Validate state tokens** in OAuth callbacks
-5. **Rate limit token refresh** attempts
-6. **Monitor for suspicious activity** (rapid token refreshes)
-7. **Implement token rotation** where supported
-8. **Store minimal user data** in connector_metadata
 
 ---
 
-## Background Jobs
+## 7. API Endpoint Summary
 
-### Job 1: Token Refresh Job
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/oauth/authorize` | Initiate OAuth flow |
+| GET | `/api/oauth/callback` | Handle OAuth callback |
+| GET | `/api/oauth/connections/:userId/:connectorId` | Check connector status |
+| GET | `/api/oauth/connections/:userId` | List all connections |
+| DELETE | `/api/oauth/connections/:userId/:connectorId/:accountIdentifier` | Revoke connection |
+| PATCH | `/api/oauth/connections/:userId/:connectorId/:accountIdentifier/scopes` | Update scopes |
+| GET | `/api/oauth/token/:userId/:connectorId/:accountIdentifier` | Get valid token |
+| POST | `/api/oauth/token/:userId/:connectorId/:accountIdentifier/refresh` | Force refresh token |
 
-**Schedule:** Every 15 minutes
-**Endpoint:** `POST /api/oauth/token/refresh-batch`**Purpose:** Proactively refresh tokens expiring within 30 minutes
+---
 
-### Job 2: Connection Health Check
+## 8. Notes for Frontend Developers
 
-**Schedule:** Every hour
-**Purpose:** Verify active connections are still valid
+1. **Multiple Accounts:** Users can connect multiple accounts per connector (e.g., 2 Gmail accounts). Always use `accountIdentifier` to specify which account.
 
-### Job 3: Cleanup Job
+2. **Token Management:** Use the `/token` endpoint to get valid tokens. It automatically refreshes expired tokens.
 
-**Schedule:** Daily at 2 AM
-**Purpose:** Remove expired connections older than 90 days
+3. **PostMessage Events:** The OAuth callback sends postMessage to the parent window. Listen for `{ success: true/false, connectorId, error }`.
 
-### Job 4: Analytics Aggregation
+4. **Account Identifiers:**
+   - Gmail: Email address
+   - LinkedIn: User ID (sub field)
+   - Facebook: User ID
 
-**Schedule:** Daily at 3 AM
-**Purpose:** Aggregate usage statistics for reporting
+5. **Status Values:** `active`, `expired`, `revoked`
+
+6. **Timestamps:** All timestamps are in ISO 8601 format with timezone (e.g., `2025-01-15T12:00:00.000000Z`)

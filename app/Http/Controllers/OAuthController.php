@@ -120,11 +120,11 @@ class OAuthController extends Controller
 
     public function checkConnection(string $userId, string $connectorId): JsonResponse
     {
-        $connection = OAuthConnection::where('user_id', $userId)
+        $connections = OAuthConnection::where('user_id', $userId)
             ->where('connector_id', $connectorId)
-            ->first();
+            ->get();
 
-        if (!$connection) {
+        if ($connections->isEmpty()) {
             return response()->json([
                 'connected' => false,
                 'connectorId' => $connectorId,
@@ -133,12 +133,15 @@ class OAuthController extends Controller
 
         return response()->json([
             'connected' => true,
-            'connectorId' => $connection->connector_id,
-            'status' => $connection->status,
-            'grantedScopes' => $connection->scopes,
-            'grantedAt' => $connection->granted_at,
-            'expiresAt' => $connection->expires_at,
-            'metadata' => $connection->connector_metadata,
+            'connectorId' => $connectorId,
+            'accounts' => $connections->map(fn($c) => [
+                'accountIdentifier' => $c->account_identifier,
+                'status' => $c->status,
+                'grantedScopes' => $c->scopes,
+                'grantedAt' => $c->granted_at,
+                'expiresAt' => $c->expires_at,
+                'metadata' => $c->connector_metadata,
+            ]),
         ]);
     }
 
@@ -153,6 +156,7 @@ class OAuthController extends Controller
         $connections = $query->get()->map(function ($conn) use ($request) {
             $data = [
                 'connectorId' => $conn->connector_id,
+                'accountIdentifier' => $conn->account_identifier,
                 'status' => $conn->status,
                 'grantedScopes' => $conn->scopes,
                 'grantedAt' => $conn->granted_at,
@@ -173,10 +177,11 @@ class OAuthController extends Controller
         ]);
     }
 
-    public function revokeConnection(Request $request, string $userId, string $connectorId): JsonResponse
+    public function revokeConnection(Request $request, string $userId, string $connectorId, string $accountIdentifier): JsonResponse
     {
         $connection = OAuthConnection::where('user_id', $userId)
             ->where('connector_id', $connectorId)
+            ->where('account_identifier', $accountIdentifier)
             ->first();
 
         if (!$connection) {
@@ -192,16 +197,18 @@ class OAuthController extends Controller
         return response()->json([
             'success' => true,
             'connectorId' => $connectorId,
+            'accountIdentifier' => $accountIdentifier,
             'revokedAt' => now(),
         ]);
     }
 
-    public function updateScopes(Request $request, string $userId, string $connectorId): JsonResponse
+    public function updateScopes(Request $request, string $userId, string $connectorId, string $accountIdentifier): JsonResponse
     {
         $request->validate(['additionalScopes' => 'required|array']);
 
         $connection = OAuthConnection::where('user_id', $userId)
             ->where('connector_id', $connectorId)
+            ->where('account_identifier', $accountIdentifier)
             ->first();
 
         if (!$connection) {
@@ -238,6 +245,102 @@ class OAuthController extends Controller
             }
         } catch (\Exception $e) {
             \Log::warning('Failed to revoke from provider', ['error' => $e->getMessage()]);
+        }
+    }
+
+    public function getValidToken(string $userId, string $connectorId, string $accountIdentifier): JsonResponse
+    {
+        $connection = OAuthConnection::where('user_id', $userId)
+            ->where('connector_id', $connectorId)
+            ->where('account_identifier', $accountIdentifier)
+            ->first();
+
+        if (!$connection) {
+            return response()->json(['error' => 'Connection not found'], 404);
+        }
+
+        if ($connection->status !== 'active') {
+            return response()->json(['error' => 'Connection is not active'], 401);
+        }
+
+        // Check if token is expired or will expire in next 5 minutes
+        if ($connection->expires_at && $connection->expires_at->subMinutes(5)->isPast()) {
+            if (!$connection->refresh_token) {
+                $connection->update(['status' => 'expired']);
+                return response()->json(['error' => 'Token expired and no refresh token available'], 401);
+            }
+
+            try {
+                $tokenData = $this->oauthService->refreshAccessToken(
+                    $connectorId,
+                    $connection->refresh_token
+                );
+
+                $connection->update([
+                    'access_token' => $tokenData['access_token'],
+                    'refresh_token' => $tokenData['refresh_token'] ?? $connection->refresh_token,
+                    'expires_at' => isset($tokenData['expires_in']) 
+                        ? now()->addSeconds($tokenData['expires_in']) 
+                        : null,
+                    'status' => 'active',
+                ]);
+            } catch (\Exception $e) {
+                $connection->update(['status' => 'expired']);
+                \Log::error('Token refresh failed', ['error' => $e->getMessage()]);
+                return response()->json(['error' => 'Failed to refresh token'], 500);
+            }
+        }
+
+        $connection->touch('updated_at');
+
+        return response()->json([
+            'accessToken' => $connection->access_token,
+            'tokenType' => $connection->token_type,
+            'expiresAt' => $connection->expires_at,
+            'scopes' => $connection->scopes,
+        ]);
+    }
+
+    public function forceRefreshToken(string $userId, string $connectorId, string $accountIdentifier): JsonResponse
+    {
+        $connection = OAuthConnection::where('user_id', $userId)
+            ->where('connector_id', $connectorId)
+            ->where('account_identifier', $accountIdentifier)
+            ->first();
+
+        if (!$connection) {
+            return response()->json(['error' => 'Connection not found'], 404);
+        }
+
+        if (!$connection->refresh_token) {
+            return response()->json(['error' => 'No refresh token available'], 400);
+        }
+
+        try {
+            $tokenData = $this->oauthService->refreshAccessToken(
+                $connectorId,
+                $connection->refresh_token
+            );
+
+            $connection->update([
+                'access_token' => $tokenData['access_token'],
+                'refresh_token' => $tokenData['refresh_token'] ?? $connection->refresh_token,
+                'expires_at' => isset($tokenData['expires_in']) 
+                    ? now()->addSeconds($tokenData['expires_in']) 
+                    : null,
+                'status' => 'active',
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'accessToken' => $tokenData['access_token'],
+                'expiresAt' => $connection->expires_at,
+                'refreshedAt' => now(),
+            ]);
+        } catch (\Exception $e) {
+            $connection->update(['status' => 'expired']);
+            \Log::error('Force refresh failed', ['error' => $e->getMessage()]);
+            return response()->json(['error' => 'Failed to refresh token: ' . $e->getMessage()], 500);
         }
     }
 }

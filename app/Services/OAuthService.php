@@ -97,8 +97,15 @@ class OAuthService
 
     public function storeConnection(string $userId, string $connectorId, array $tokenData, array $scopes): OAuthConnection
     {
+        $metadata = $this->getConnectorMetadata($connectorId, $tokenData['access_token']);
+        $accountId = $this->extractAccountIdentifier($connectorId, $metadata);
+
         return OAuthConnection::updateOrCreate(
-            ['user_id' => $userId, 'connector_id' => $connectorId],
+            [
+                'user_id' => $userId,
+                'connector_id' => $connectorId,
+                'account_identifier' => $accountId
+            ],
             [
                 'access_token' => $tokenData['access_token'],
                 'refresh_token' => $tokenData['refresh_token'] ?? null,
@@ -108,10 +115,43 @@ class OAuthService
                     : null,
                 'scopes' => $scopes,
                 'status' => 'active',
-                'connector_metadata' => $this->getConnectorMetadata($connectorId, $tokenData['access_token']),
+                'connector_metadata' => $metadata,
                 'granted_at' => now(),
             ]
         );
+    }
+
+    private function extractAccountIdentifier(string $connectorId, array $metadata): ?string
+    {
+        return match($connectorId) {
+            'gmail' => $metadata['email'] ?? $metadata['id'] ?? null,
+            'linkedin' => $metadata['sub'] ?? $metadata['id'] ?? null,
+            'facebook' => $metadata['id'] ?? null,
+            'stripe' => $metadata['stripe_user_id'] ?? null,
+            default => $metadata['id'] ?? $metadata['email'] ?? null,
+        };
+    }
+
+    public function refreshAccessToken(string $connectorId, string $refreshToken): array
+    {
+        if (!isset($this->connectors[$connectorId])) {
+            throw new \InvalidArgumentException("Unsupported connector: {$connectorId}");
+        }
+
+        $connector = $this->connectors[$connectorId];
+        
+        $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], [
+            'client_id' => env($connector['client_id']),
+            'client_secret' => env($connector['client_secret']),
+            'refresh_token' => $refreshToken,
+            'grant_type' => 'refresh_token',
+        ]);
+
+        if (!$response->successful()) {
+            throw new \Exception("Failed to refresh token: " . $response->body());
+        }
+
+        return $response->json();
     }
 
     private function getConnectorMetadata(string $connectorId, string $accessToken): array
