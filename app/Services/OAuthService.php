@@ -44,11 +44,9 @@ class OAuthService
 
     public function generateAuthUrl(string $connectorId, string $userId, string $scopes, ?string $redirectUri = null): array
     {
-        if (!isset($this->connectors[$connectorId])) {
-            throw new \InvalidArgumentException("Unsupported connector: {$connectorId}");
-        }
+        // Get connector config or use Google as default for Google services
+        $connector = $this->connectors[$connectorId] ?? $this->getDefaultConnector($connectorId);
 
-        $connector = $this->connectors[$connectorId];
         $state = base64_encode(json_encode([
             'user_id' => $userId,
             'connector_id' => $connectorId,
@@ -61,6 +59,8 @@ class OAuthService
             'scope' => $scopes,
             'response_type' => 'code',
             'state' => $state,
+            'access_type' => 'offline',
+            'prompt' => 'consent',
         ];
 
         $authUrl = $connector['auth_url'] . '?' . http_build_query($params);
@@ -72,13 +72,32 @@ class OAuthService
         ];
     }
 
-    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri): array
+    private function getDefaultConnector(string $connectorId): array
     {
-        if (!isset($this->connectors[$connectorId])) {
-            throw new \InvalidArgumentException("Unsupported connector: {$connectorId}");
+        // Map connectors to OAuth providers
+        $googleServices = ['youtube', 'calendar', 'drive', 'gmail', 'google-calendar', 'google-drive', 'google-youtube', 'google-business'];
+        $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+        
+        if (in_array($connectorId, $googleServices)) {
+            return $this->connectors['gmail'];
+        }
+        
+        if (in_array($connectorId, $facebookServices)) {
+            return $this->connectors['facebook'];
         }
 
-        $connector = $this->connectors[$connectorId];
+        // For any other connector, return a generic OAuth2 config
+        return [
+            'auth_url' => 'https://oauth.provider.com/authorize',
+            'token_url' => 'https://oauth.provider.com/token',
+            'client_id' => 'GOOGLE_CLIENT_ID', // Default to Google
+            'client_secret' => 'GOOGLE_CLIENT_SECRET',
+        ];
+    }
+
+    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri): array
+    {
+        $connector = $this->connectors[$connectorId] ?? $this->getDefaultConnector($connectorId);
         
         $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], [
             'client_id' => env($connector['client_id']),
@@ -123,12 +142,23 @@ class OAuthService
 
     private function extractAccountIdentifier(string $connectorId, array $metadata): ?string
     {
+        // Google services use email
+        $googleServices = ['youtube', 'calendar', 'drive', 'gmail', 'google-calendar', 'google-drive', 'google-youtube', 'google-business'];
+        
+        if (in_array($connectorId, $googleServices)) {
+            return $metadata['email'] ?? $metadata['id'] ?? null;
+        }
+
+        // Facebook services use id
+        $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+        if (in_array($connectorId, $facebookServices)) {
+            return $metadata['id'] ?? null;
+        }
+
         return match($connectorId) {
-            'gmail' => $metadata['email'] ?? $metadata['id'] ?? null,
             'linkedin' => $metadata['sub'] ?? $metadata['id'] ?? null,
-            'facebook' => $metadata['id'] ?? null,
             'stripe' => $metadata['stripe_user_id'] ?? null,
-            default => $metadata['id'] ?? $metadata['email'] ?? null,
+            default => $metadata['id'] ?? $metadata['email'] ?? $metadata['sub'] ?? null,
         };
     }
 
@@ -157,21 +187,28 @@ class OAuthService
     private function getConnectorMetadata(string $connectorId, string $accessToken): array
     {
         try {
+            // Google services use same userinfo endpoint
+            $googleServices = ['youtube', 'calendar', 'drive', 'gmail', 'google-calendar', 'google-drive', 'google-youtube', 'google-business'];
+            
+            if (in_array($connectorId, $googleServices)) {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->get('https://www.googleapis.com/oauth2/v2/userinfo');
+                return $response->successful() ? $response->json() : [];
+            }
+
+            // Facebook services use Graph API
+            $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+            if (in_array($connectorId, $facebookServices)) {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->get('https://graph.facebook.com/me?fields=id,name,email');
+                return $response->successful() ? $response->json() : [];
+            }
+
             switch ($connectorId) {
-                case 'gmail':
-                    $response = Http::withoutVerifying()->withToken($accessToken)
-                        ->get('https://www.googleapis.com/oauth2/v2/userinfo');
-                    return $response->successful() ? $response->json() : [];
-                
                 case 'linkedin':
                     $response = Http::withoutVerifying()->withToken($accessToken)
                         ->withHeaders(['X-Restli-Protocol-Version' => '2.0.0'])
                         ->get('https://api.linkedin.com/v2/userinfo');
-                    return $response->successful() ? $response->json() : [];
-                
-                case 'facebook':
-                    $response = Http::withoutVerifying()->withToken($accessToken)
-                        ->get('https://graph.facebook.com/me');
                     return $response->successful() ? $response->json() : [];
                 
                 default:

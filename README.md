@@ -6,9 +6,127 @@ Complete backend API for managing OAuth connections, tokens, and multi-account s
 
 **Base URL:** `http://localhost:8000/api/oauth`
 
-**Supported Connectors:** Gmail, LinkedIn, Facebook, Stripe, Shopify
+**Supported Connectors:** Gmail, LinkedIn, Facebook, Stripe, Shopify, YouTube, Calendar, Drive, Instagram, WhatsApp, and more
 
 **Database:** PostgreSQL (Prisma Cloud)
+
+---
+
+## Setup Requirements
+
+### 1. Create OAuth Apps for Each Connector
+
+Before using any connector, you must create an OAuth application with the provider:
+
+#### Google Services (Gmail, YouTube, Calendar, Drive, Business)
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select existing
+3. Enable required APIs (Gmail API, YouTube API, Calendar API, etc.)
+4. Go to **Credentials** → **Create Credentials** → **OAuth 2.0 Client ID**
+5. Set application type to **Web application**
+6. Add authorized redirect URI: `http://localhost:8000/api/oauth/callback`
+7. Copy **Client ID** and **Client Secret**
+
+#### LinkedIn
+1. Go to [LinkedIn Developers](https://www.linkedin.com/developers/apps)
+2. Create a new app
+3. Add **Authorized redirect URLs**: `http://localhost:8000/api/oauth/callback`
+4. Request access to required products (Sign In with LinkedIn, Share on LinkedIn, etc.)
+5. Copy **Client ID** and **Client Secret**
+
+#### Facebook/Instagram/WhatsApp
+1. Go to [Meta for Developers](https://developers.facebook.com/)
+2. Create a new app
+3. Add **Facebook Login** product
+4. Add **Valid OAuth Redirect URIs**: `http://localhost:8000/api/oauth/callback`
+5. Copy **App ID** (Client ID) and **App Secret** (Client Secret)
+
+#### Stripe
+1. Go to [Stripe Dashboard](https://dashboard.stripe.com/)
+2. Navigate to **Settings** → **Connect**
+3. Add redirect URI: `http://localhost:8000/api/oauth/callback`
+4. Copy **Client ID** and **Secret Key**
+
+#### Shopify
+1. Go to [Shopify Partners](https://partners.shopify.com/)
+2. Create a new app
+3. Set **App URL** and **Allowed redirection URL(s)**: `http://localhost:8000/api/oauth/callback`
+4. Copy **API key** (Client ID) and **API secret key** (Client Secret)
+
+### 2. App Verification for Advanced Scopes
+
+Some scopes require app verification:
+
+#### Google
+- **Sensitive scopes** (Gmail send, Drive full access, Calendar write) require OAuth verification
+- Submit app for verification at [Google OAuth Verification](https://support.google.com/cloud/answer/9110914)
+- Process takes 4-6 weeks
+- Until verified, limited to 100 test users
+
+#### LinkedIn
+- **Marketing Developer Platform** access required for:
+  - `w_organization_social` (Post as organization)
+  - `r_organization_social` (Read organization posts)
+- Apply at [LinkedIn Partner Programs](https://www.linkedin.com/help/linkedin/answer/a545808)
+- Requires business verification
+
+#### Facebook/Instagram
+- **Business verification** required for:
+  - `pages_manage_posts`
+  - `instagram_content_publish`
+  - `whatsapp_business_messaging`
+- Submit at [Meta Business Verification](https://developers.facebook.com/docs/development/release/business-verification)
+
+### 3. Configure Redirect URIs
+
+Add the callback URL to each OAuth app's allowed redirect URIs:
+
+**Development:**
+```
+http://localhost:8000/api/oauth/callback
+```
+
+**Production:**
+```
+https://yourdomain.com/api/oauth/callback
+```
+
+### 4. Environment Variables Setup
+
+Add OAuth credentials to your `.env` file:
+
+```env
+# Application
+APP_URL=http://localhost:8000
+
+# Google Services (Gmail, YouTube, Calendar, Drive, Business)
+GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-your_google_client_secret
+
+# LinkedIn
+LINKEDIN_CLIENT_ID=your_linkedin_client_id
+LINKEDIN_CLIENT_SECRET=your_linkedin_client_secret
+
+# Facebook/Instagram/WhatsApp
+FACEBOOK_CLIENT_ID=your_facebook_app_id
+FACEBOOK_CLIENT_SECRET=your_facebook_app_secret
+
+# Stripe
+STRIPE_CLIENT_ID=ca_your_stripe_client_id
+STRIPE_CLIENT_SECRET=sk_your_stripe_secret_key
+
+# Shopify
+SHOPIFY_CLIENT_ID=your_shopify_api_key
+SHOPIFY_CLIENT_SECRET=your_shopify_api_secret
+
+# Database
+DB_CONNECTION=pgsql
+DB_HOST=db.prisma.io
+DB_PORT=5432
+DB_DATABASE=postgres
+DB_USERNAME=your_username
+DB_PASSWORD=your_password
+```
 
 ---
 
