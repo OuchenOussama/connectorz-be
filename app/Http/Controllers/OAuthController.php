@@ -60,13 +60,16 @@ class OAuthController extends Controller
             $tokenData = $this->oauthService->exchangeCodeForTokens(
                 $stateData['connector_id'],
                 $request->code,
-                $redirectUri
+                $redirectUri,
+                $stateData['user_id']
             );
             \Log::info('Token Data', $tokenData);
 
             $scopes = isset($tokenData['scope']) ? explode(' ', $tokenData['scope']) : [];
-            if (empty($scopes) && $request->has('scope')) {
-                $scopes = explode(' ', $request->input('scope'));
+            
+            // If provider doesn't return scopes in token, log warning
+            if (empty($scopes)) {
+                \Log::warning('No scopes returned in token response', ['connector' => $stateData['connector_id']]);
             }
             
             $connection = $this->oauthService->storeConnection(

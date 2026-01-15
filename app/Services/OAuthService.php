@@ -40,6 +40,18 @@ class OAuthService
             'client_id' => 'FACEBOOK_CLIENT_ID',
             'client_secret' => 'FACEBOOK_CLIENT_SECRET',
         ],
+        'instagram' => [
+            'auth_url' => 'https://www.instagram.com/oauth/authorize',
+            'token_url' => 'https://api.instagram.com/oauth/access_token',
+            'client_id' => 'INSTAGRAM_CLIENT_ID',
+            'client_secret' => 'INSTAGRAM_CLIENT_SECRET',
+        ],
+        'tiktok' => [
+            'auth_url' => 'https://www.tiktok.com/v2/auth/authorize',
+            'token_url' => 'https://open.tiktokapis.com/v2/oauth/token',
+            'client_id' => 'TIKTOK_CLIENT_ID',
+            'client_secret' => 'TIKTOK_CLIENT_SECRET',
+        ],
     ];
 
     public function generateAuthUrl(string $connectorId, string $userId, string $scopes, ?string $redirectUri = null): array
@@ -63,6 +75,16 @@ class OAuthService
             'prompt' => 'consent',
         ];
 
+        // TikTok requires PKCE
+        if ($connectorId === 'tiktok') {
+            $codeVerifier = Str::random(64);
+            $codeChallenge = rtrim(strtr(base64_encode(hash('sha256', $codeVerifier, true)), '+/', '-_'), '=');
+            $params['code_challenge'] = $codeChallenge;
+            $params['code_challenge_method'] = 'S256';
+            unset($params['access_type'], $params['prompt']);
+            session(['tiktok_code_verifier_' . $userId => $codeVerifier]);
+        }
+
         $authUrl = $connector['auth_url'] . '?' . http_build_query($params);
 
         return [
@@ -76,7 +98,7 @@ class OAuthService
     {
         // Map connectors to OAuth providers
         $googleServices = ['youtube', 'calendar', 'drive', 'gmail', 'google-calendar', 'google-drive', 'google-youtube', 'google-business'];
-        $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+        $facebookServices = ['facebook', 'whatsapp'];
         
         if (in_array($connectorId, $googleServices)) {
             return $this->connectors['gmail'];
@@ -95,17 +117,25 @@ class OAuthService
         ];
     }
 
-    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri): array
+    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri, ?string $userId = null): array
     {
         $connector = $this->connectors[$connectorId] ?? $this->getDefaultConnector($connectorId);
         
-        $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], [
+        $params = [
             'client_id' => env($connector['client_id']),
             'client_secret' => env($connector['client_secret']),
             'code' => $code,
             'grant_type' => 'authorization_code',
             'redirect_uri' => $redirectUri,
-        ]);
+        ];
+
+        // TikTok requires PKCE code_verifier
+        if ($connectorId === 'tiktok' && $userId) {
+            $params['code_verifier'] = session('tiktok_code_verifier_' . $userId);
+            session()->forget('tiktok_code_verifier_' . $userId);
+        }
+
+        $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], $params);
 
         if (!$response->successful()) {
             throw new \Exception("Failed to exchange code for tokens: " . $response->body());
@@ -150,13 +180,15 @@ class OAuthService
         }
 
         // Facebook services use id
-        $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+        $facebookServices = ['facebook', 'whatsapp'];
         if (in_array($connectorId, $facebookServices)) {
             return $metadata['id'] ?? null;
         }
 
         return match($connectorId) {
             'linkedin' => $metadata['sub'] ?? $metadata['id'] ?? null,
+            'instagram' => $metadata['user_id'] ?? $metadata['id'] ?? null,
+            'tiktok' => $metadata['open_id'] ?? $metadata['union_id'] ?? null,
             'stripe' => $metadata['stripe_user_id'] ?? null,
             default => $metadata['id'] ?? $metadata['email'] ?? $metadata['sub'] ?? null,
         };
@@ -197,11 +229,25 @@ class OAuthService
             }
 
             // Facebook services use Graph API
-            $facebookServices = ['facebook', 'instagram', 'whatsapp'];
+            $facebookServices = ['facebook', 'whatsapp'];
             if (in_array($connectorId, $facebookServices)) {
                 $response = Http::withoutVerifying()->withToken($accessToken)
-                    ->get('https://graph.facebook.com/me?fields=id,name,email');
+                    ->get('https://graph.facebook.com/me?fields=id,name,email,picture');
                 return $response->successful() ? $response->json() : [];
+            }
+
+            // Instagram uses its own API
+            if ($connectorId === 'instagram') {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->get('https://graph.instagram.com/me?fields=id,username,account_type');
+                return $response->successful() ? $response->json() : [];
+            }
+
+            // TikTok uses its own API
+            if ($connectorId === 'tiktok') {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->post('https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name');
+                return $response->successful() ? $response->json()['data']['user'] ?? [] : [];
             }
 
             switch ($connectorId) {
