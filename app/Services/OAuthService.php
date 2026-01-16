@@ -29,8 +29,8 @@ class OAuthService
             'client_secret' => 'STRIPE_CLIENT_SECRET',
         ],
         'shopify' => [
-            'auth_url' => 'https://{shop}.myshopify.com/admin/oauth/authorize',
-            'token_url' => 'https://{shop}.myshopify.com/admin/oauth/access_token',
+            'auth_url' => '{shop}/admin/oauth/authorize',
+            'token_url' => '{shop}/admin/oauth/access_token',
             'client_id' => 'SHOPIFY_CLIENT_ID',
             'client_secret' => 'SHOPIFY_CLIENT_SECRET',
         ],
@@ -52,18 +52,51 @@ class OAuthService
             'client_id' => 'TIKTOK_CLIENT_ID',
             'client_secret' => 'TIKTOK_CLIENT_SECRET',
         ],
+        'notion' => [
+            'auth_url' => 'https://api.notion.com/v1/oauth/authorize',
+            'token_url' => 'https://api.notion.com/v1/oauth/token',
+            'client_id' => 'NOTION_CLIENT_ID',
+            'client_secret' => 'NOTION_CLIENT_SECRET',
+        ],
+        'paypal' => [
+            'auth_url' => 'https://www.sandbox.paypal.com/connect',
+            'token_url' => 'https://api-m.sandbox.paypal.com/v1/oauth2/token',
+            'client_id' => 'PAYPAL_CLIENT_ID',
+            'client_secret' => 'PAYPAL_CLIENT_SECRET',
+        ],
+        'slack' => [
+            'auth_url' => 'https://slack.com/oauth/v2/authorize',
+            'token_url' => 'https://slack.com/api/oauth.v2.access',
+            'client_id' => 'SLACK_CLIENT_ID',
+            'client_secret' => 'SLACK_CLIENT_SECRET',
+        ],
     ];
 
-    public function generateAuthUrl(string $connectorId, string $userId, string $scopes, ?string $redirectUri = null): array
+    public function generateAuthUrl(string $connectorId, string $userId, string $scopes, ?string $redirectUri = null, ?string $shop = null): array
     {
         // Get connector config or use Google as default for Google services
         $connector = $this->connectors[$connectorId] ?? $this->getDefaultConnector($connectorId);
-
-        $state = base64_encode(json_encode([
-            'user_id' => $userId,
-            'connector_id' => $connectorId,
-            'csrf_token' => Str::random(32),
-        ]));
+        
+        // Handle Shopify dynamic URLs
+        if ($connectorId === 'shopify') {
+            if (!$shop) {
+                throw new \InvalidArgumentException('Shop parameter is required for Shopify');
+            }
+            $connector['auth_url'] = "https://{$shop}/admin/oauth/authorize";
+            $connector['token_url'] = "https://{$shop}/admin/oauth/access_token";
+            $state = base64_encode(json_encode([
+                'user_id' => $userId,
+                'connector_id' => $connectorId,
+                'csrf_token' => Str::random(32),
+                'shop' => $shop,
+            ]));
+        } else {
+            $state = base64_encode(json_encode([
+                'user_id' => $userId,
+                'connector_id' => $connectorId,
+                'csrf_token' => Str::random(32),
+            ]));
+        }
 
         $params = [
             'client_id' => env($connector['client_id']),
@@ -75,6 +108,29 @@ class OAuthService
             'prompt' => 'consent',
         ];
 
+        // Slack requires HTTPS - use localtunnel URL - TODO : Change at Production
+        if ($connectorId === 'slack') {
+            $params['redirect_uri'] = $redirectUri ?: 'https://violet-parents-double.loca.lt/api/oauth/callback';
+            unset($params['access_type'], $params['prompt']);
+        }
+
+        // Shopify doesn't use access_type and prompt
+        if ($connectorId === 'shopify') {
+            unset($params['access_type'], $params['prompt']);
+        }
+        
+        // PayPal requires flowEntry parameter and different param names
+        if ($connectorId === 'paypal') {
+            $params = [
+                'client_id' => env($connector['client_id']),
+                'response_type' => 'code',
+                'scope' => $scopes,
+                'redirect_uri' => $redirectUri ?: config('app.url') . '/api/oauth/callback',
+                'state' => $state,
+                'flowEntry' => 'static',
+            ];
+        }
+        
         // TikTok requires PKCE
         if ($connectorId === 'tiktok') {
             $codeVerifier = Str::random(64);
@@ -117,9 +173,17 @@ class OAuthService
         ];
     }
 
-    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri, ?string $userId = null): array
+    public function exchangeCodeForTokens(string $connectorId, string $code, string $redirectUri, ?string $userId = null, ?string $shop = null): array
     {
         $connector = $this->connectors[$connectorId] ?? $this->getDefaultConnector($connectorId);
+        
+        // Handle Shopify dynamic URLs
+        if ($connectorId === 'shopify') {
+            if (!$shop) {
+                throw new \InvalidArgumentException('Shop parameter is required for Shopify');
+            }
+            $connector['token_url'] = "https://{$shop}/admin/oauth/access_token";
+        }
         
         $params = [
             'client_id' => env($connector['client_id']),
@@ -129,25 +193,75 @@ class OAuthService
             'redirect_uri' => $redirectUri,
         ];
 
+        // Slack requires the same redirect_uri used in authorization
+        if ($connectorId === 'slack') {
+            $params['redirect_uri'] = 'https://violet-parents-double.loca.lt/api/oauth/callback';
+        }
+
         // TikTok requires PKCE code_verifier
         if ($connectorId === 'tiktok' && $userId) {
             $params['code_verifier'] = session('tiktok_code_verifier_' . $userId);
             session()->forget('tiktok_code_verifier_' . $userId);
         }
 
-        $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], $params);
+        // Notion requires Basic Auth
+        if ($connectorId === 'notion') {
+            $auth = base64_encode(env($connector['client_id']) . ':' . env($connector['client_secret']));
+            unset($params['client_id'], $params['client_secret']);
+            $response = Http::withoutVerifying()
+                ->withHeaders(['Authorization' => 'Basic ' . $auth])
+                ->asJson()
+                ->post($connector['token_url'], $params);
+        } elseif ($connectorId === 'paypal') {
+            $auth = base64_encode(env($connector['client_id']) . ':' . env($connector['client_secret']));
+            $response = Http::withoutVerifying()
+                ->withHeaders(['Authorization' => 'Basic ' . $auth])
+                ->asForm()
+                ->post($connector['token_url'], [
+                    'grant_type' => 'authorization_code',
+                    'code' => $code,
+                ]);
+        } else {
+            $response = Http::withoutVerifying()->asForm()->post($connector['token_url'], $params);
+        }
 
         if (!$response->successful()) {
             throw new \Exception("Failed to exchange code for tokens: " . $response->body());
         }
 
-        return $response->json();
+        $data = $response->json();
+        \Log::info('Token exchange response', ['connector' => $connectorId, 'data' => $data]);
+        
+        // Slack returns tokens in different structure
+        if ($connectorId === 'slack') {
+            if (isset($data['authed_user']['access_token'])) {
+                return [
+                    'access_token' => $data['authed_user']['access_token'],
+                    'token_type' => 'Bearer',
+                    'scope' => $data['authed_user']['scope'] ?? '',
+                    'team' => $data['team'] ?? [],
+                    'authed_user' => $data['authed_user'],
+                ];
+            } elseif (isset($data['access_token'])) {
+                return $data;
+            } else {
+                throw new \Exception("Slack token response missing access_token: " . json_encode($data));
+            }
+        }
+
+        return $data;
     }
 
-    public function storeConnection(string $userId, string $connectorId, array $tokenData, array $scopes): OAuthConnection
+    public function storeConnection(string $userId, string $connectorId, array $tokenData, array $scopes, ?string $shop = null): OAuthConnection
     {
-        $metadata = $this->getConnectorMetadata($connectorId, $tokenData['access_token']);
-        $accountId = $this->extractAccountIdentifier($connectorId, $metadata);
+        // Shopify - fetch shop metadata using access token
+        if ($connectorId === 'shopify' && $shop) {
+            $metadata = $this->getConnectorMetadata($connectorId, $tokenData['access_token'], $shop);
+            $accountId = $metadata['domain'] ?? $metadata['myshopify_domain'] ?? $shop;
+        } else {
+            $metadata = $this->getConnectorMetadata($connectorId, $tokenData['access_token']);
+            $accountId = $this->extractAccountIdentifier($connectorId, $metadata);
+        }
 
         return OAuthConnection::updateOrCreate(
             [
@@ -190,6 +304,10 @@ class OAuthService
             'instagram' => $metadata['user_id'] ?? $metadata['id'] ?? null,
             'tiktok' => $metadata['open_id'] ?? $metadata['union_id'] ?? null,
             'stripe' => $metadata['stripe_user_id'] ?? null,
+            'shopify' => $metadata['domain'] ?? $metadata['myshopify_domain'] ?? null,
+            'notion' => $metadata['workspace_id'] ?? $metadata['id'] ?? null,
+            'paypal' => $metadata['user_id'] ?? $metadata['payer_id'] ?? null,
+            'slack' => $metadata['user_id'] ?? $metadata['team_id'] ?? null,
             default => $metadata['id'] ?? $metadata['email'] ?? $metadata['sub'] ?? null,
         };
     }
@@ -216,7 +334,7 @@ class OAuthService
         return $response->json();
     }
 
-    private function getConnectorMetadata(string $connectorId, string $accessToken): array
+    private function getConnectorMetadata(string $connectorId, string $accessToken, ?string $shop = null): array
     {
         try {
             // Google services use same userinfo endpoint
@@ -248,6 +366,74 @@ class OAuthService
                 $response = Http::withoutVerifying()->withToken($accessToken)
                     ->post('https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name');
                 return $response->successful() ? $response->json()['data']['user'] ?? [] : [];
+            }
+
+            // Notion uses its own API
+            if ($connectorId === 'notion') {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->withHeaders(['Notion-Version' => '2022-06-28'])
+                    ->get('https://api.notion.com/v1/users/me');
+                if ($response->successful()) {
+                    $data = $response->json();
+                    // Get workspace details
+                    $workspaceResponse = Http::withoutVerifying()->withToken($accessToken)
+                        ->withHeaders(['Notion-Version' => '2022-06-28'])
+                        ->post('https://api.notion.com/v1/search', ['page_size' => 1]);
+                    
+                    $metadata = [
+                        'workspace_id' => $data['bot']['workspace_id'] ?? null,
+                        'workspace_name' => $data['bot']['workspace_name'] ?? null,
+                        'workspace_icon' => $data['bot']['workspace_icon'] ?? null,
+                        'user_id' => $data['bot']['owner']['user']['id'] ?? null,
+                        'user_name' => $data['bot']['owner']['user']['name'] ?? null,
+                        'user_email' => $data['bot']['owner']['user']['person']['email'] ?? null,
+                        'user_avatar' => $data['bot']['owner']['user']['avatar_url'] ?? null,
+                    ];
+                    return $metadata;
+                }
+                return [];
+            }
+
+            // PayPal uses its own API
+            if ($connectorId === 'paypal') {
+                $response = Http::withoutVerifying()->withToken($accessToken)
+                    ->get('https://api.paypal.com/v1/identity/oauth2/userinfo?schema=paypalv1.1');
+                return $response->successful() ? $response->json() : [];
+            }
+
+            // Slack uses its own API
+            if ($connectorId === 'slack') {
+                $authResponse = Http::withoutVerifying()->withToken($accessToken)
+                    ->get('https://slack.com/api/auth.test');
+                $authData = $authResponse->json();
+                
+                if ($authData['ok'] && isset($authData['user_id'])) {
+                    $userResponse = Http::withoutVerifying()->withToken($accessToken)
+                        ->get('https://slack.com/api/users.info?user=' . $authData['user_id']);
+                    $userData = $userResponse->json();
+                    
+                    if ($userData['ok']) {
+                        return array_merge($authData, [
+                            'user_profile' => $userData['user']['profile'] ?? [],
+                            'user_real_name' => $userData['user']['real_name'] ?? null,
+                            'user_email' => $userData['user']['profile']['email'] ?? null,
+                        ]);
+                    }
+                }
+                
+                return $authData;
+            }
+
+            // Shopify uses shop info endpoint
+            if ($connectorId === 'shopify' && $shop) {
+                $response = Http::withoutVerifying()
+                    ->withHeaders(['X-Shopify-Access-Token' => $accessToken])
+                    ->get("https://{$shop}/admin/api/2024-01/shop.json");
+                if ($response->successful()) {
+                    $data = $response->json();
+                    return $data['shop'] ?? [];
+                }
+                return ['domain' => $shop, 'myshopify_domain' => $shop];
             }
 
             switch ($connectorId) {

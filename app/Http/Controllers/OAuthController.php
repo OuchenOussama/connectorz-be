@@ -20,6 +20,7 @@ class OAuthController extends Controller
             'connectorId' => 'required|string',
             'scopes' => 'required|string',
             'redirectUri' => 'nullable|url',
+            'shop' => 'nullable|string',
         ]);
 
         try {
@@ -27,7 +28,8 @@ class OAuthController extends Controller
                 $request->connectorId,
                 $request->userId,
                 $request->scopes,
-                $request->redirectUri
+                $request->redirectUri,
+                $request->shop
             );
 
             return redirect($authData['authUrl']);
@@ -41,6 +43,11 @@ class OAuthController extends Controller
     public function callback(Request $request): Response
     {
         \Log::info('OAuth Callback Hit', $request->all());
+        
+        // Shopify sends different parameters
+        if ($request->has('shop') && $request->has('hmac')) {
+            return $this->handleShopifyCallback($request);
+        }
         
         $request->validate([
             'code' => 'required|string',
@@ -61,7 +68,8 @@ class OAuthController extends Controller
                 $stateData['connector_id'],
                 $request->code,
                 $redirectUri,
-                $stateData['user_id']
+                $stateData['user_id'],
+                $stateData['shop'] ?? null
             );
             \Log::info('Token Data', $tokenData);
 
@@ -72,11 +80,46 @@ class OAuthController extends Controller
                 \Log::warning('No scopes returned in token response', ['connector' => $stateData['connector_id']]);
             }
             
+            // Check if connection already exists with same scopes
+            $existing = OAuthConnection::where('user_id', $stateData['user_id'])
+                ->where('connector_id', $stateData['connector_id'])
+                ->first();
+            
+            if ($existing && $existing->scopes == $scopes && $existing->status === 'active') {
+                \Log::info('Connection already exists with same scopes', ['id' => $existing->id]);
+                
+                $html = '<!DOCTYPE html>
+<html>
+<head>
+    <title>Already Connected</title>
+</head>
+<body>
+    <script>
+        window.opener.postMessage({ 
+            success: true, 
+            connectorId: "' . $stateData['connector_id'] . '",
+            alreadyConnected: true
+        }, "*");
+        window.close();
+    </script>
+    <p>This account is already connected with the same permissions.</p>
+</body>
+</html>';
+                
+                return response($html)->header('Content-Type', 'text/html');
+            }
+            
+            // If revoked, reactivate with new tokens
+            if ($existing && $existing->status === 'revoked') {
+                \Log::info('Reactivating revoked connection', ['id' => $existing->id]);
+            }
+            
             $connection = $this->oauthService->storeConnection(
                 $stateData['user_id'],
                 $stateData['connector_id'],
                 $tokenData,
-                $scopes
+                $scopes,
+                $stateData['shop'] ?? null
             );
             \Log::info('Connection Stored', ['id' => $connection->id]);
 
@@ -112,6 +155,80 @@ class OAuthController extends Controller
             error: "' . $e->getMessage() . '" 
         }, "*");
         window.close();
+    </script>
+    <p>Authorization failed: ' . $e->getMessage() . '</p>
+</body>
+</html>';
+
+            return response($html, 400)->header('Content-Type', 'text/html');
+        }
+    }
+
+    private function handleShopifyCallback(Request $request): Response
+    {
+        try {
+            $stateData = json_decode(base64_decode($request->state), true);
+            
+            if (!$stateData || !isset($stateData['user_id'], $stateData['connector_id'])) {
+                throw new \Exception('Invalid state parameter');
+            }
+
+            $redirectUri = config('app.url') . '/api/oauth/callback';
+            
+            $tokenData = $this->oauthService->exchangeCodeForTokens(
+                'shopify',
+                $request->code,
+                $redirectUri,
+                $stateData['user_id'],
+                $request->shop
+            );
+
+            $scopes = isset($tokenData['scope']) ? explode(',', $tokenData['scope']) : [];
+            
+            $connection = $this->oauthService->storeConnection(
+                $stateData['user_id'],
+                'shopify',
+                $tokenData,
+                $scopes,
+                $request->shop
+            );
+
+            $html = '<!DOCTYPE html>
+<html>
+<head>
+    <title>Authorization Complete</title>
+</head>
+<body>
+    <script>
+        if (window.opener) {
+            window.opener.postMessage({ 
+                success: true, 
+                connectorId: "shopify" 
+            }, "*");
+        }
+        setTimeout(() => window.close(), 500);
+    </script>
+    <p>Authorization complete. Closing window...</p>
+</body>
+</html>';
+
+            return response($html)->header('Content-Type', 'text/html');
+        } catch (\Exception $e) {
+            \Log::error('Shopify Callback Error', ['error' => $e->getMessage()]);
+            $html = '<!DOCTYPE html>
+<html>
+<head>
+    <title>Authorization Failed</title>
+</head>
+<body>
+    <script>
+        if (window.opener) {
+            window.opener.postMessage({ 
+                success: false, 
+                error: "' . $e->getMessage() . '" 
+            }, "*");
+        }
+        setTimeout(() => window.close(), 500);
     </script>
     <p>Authorization failed: ' . $e->getMessage() . '</p>
 </body>
@@ -240,11 +357,21 @@ class OAuthController extends Controller
         try {
             $revokeUrls = [
                 'gmail' => 'https://oauth2.googleapis.com/revoke',
+                'youtube' => 'https://oauth2.googleapis.com/revoke',
+                'calendar' => 'https://oauth2.googleapis.com/revoke',
+                'drive' => 'https://oauth2.googleapis.com/revoke',
                 'linkedin' => 'https://www.linkedin.com/oauth/v2/revoke',
+                'facebook' => 'https://graph.facebook.com/me/permissions',
+                'instagram' => 'https://graph.facebook.com/me/permissions',
+                'whatsapp' => 'https://graph.facebook.com/me/permissions',
             ];
 
             if (isset($revokeUrls[$connectorId])) {
-                Http::withoutVerifying()->post($revokeUrls[$connectorId], ['token' => $accessToken]);
+                if (in_array($connectorId, ['facebook', 'instagram', 'whatsapp'])) {
+                    Http::withoutVerifying()->delete($revokeUrls[$connectorId] . '?access_token=' . $accessToken);
+                } else {
+                    Http::withoutVerifying()->post($revokeUrls[$connectorId], ['token' => $accessToken]);
+                }
             }
         } catch (\Exception $e) {
             \Log::warning('Failed to revoke from provider', ['error' => $e->getMessage()]);
@@ -288,9 +415,9 @@ class OAuthController extends Controller
                     'status' => 'active',
                 ]);
             } catch (\Exception $e) {
-                $connection->update(['status' => 'expired']);
-                \Log::error('Token refresh failed', ['error' => $e->getMessage()]);
-                return response()->json(['error' => 'Failed to refresh token'], 500);
+                $connection->update(['status' => 'revoked']);
+                \Log::error('Token refresh failed - likely revoked by user', ['error' => $e->getMessage()]);
+                return response()->json(['error' => 'Token was revoked by user', 'requiresReauth' => true], 401);
             }
         }
 
